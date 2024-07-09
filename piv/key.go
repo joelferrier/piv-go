@@ -88,6 +88,8 @@ var formFactorStrings = map[Formfactor]string{
 	FormfactorUSBCKeychain:          "USB-C Keychain",
 	FormfactorUSBCNano:              "USB-C Nano",
 	FormfactorUSBCLightningKeychain: "USB-C/Lightning Keychain",
+	FormfactorUSBABio:               "USB-A Bio",
+	FormfactorUSBCBio:               "USB-C Bio",
 
 	FormfactorUSBAKeychainFIPS:          "USB-A Keychain FIPS",
 	FormfactorUSBANanoFIPS:              "USB-A Nano FIPS",
@@ -113,6 +115,8 @@ const (
 	FormfactorUSBCKeychain          = 0x3
 	FormfactorUSBCNano              = 0x4
 	FormfactorUSBCLightningKeychain = 0x5
+	FormfactorUSBABio               = 0x6
+	FormfactorUSBCBio               = 0x7
 
 	FormfactorUSBAKeychainFIPS          = 0x81
 	FormfactorUSBANanoFIPS              = 0x82
@@ -179,6 +183,10 @@ func (a *Attestation) addExt(e pkix.Extension) error {
 			a.PINPolicy = PINPolicyOnce
 		case 0x03:
 			a.PINPolicy = PINPolicyAlways
+		case 0x04:
+			a.PINPolicy = PINPolicyMatchOnce
+		case 0x05:
+			a.PINPolicy = PINPolicyMatchAlways
 		default:
 			return fmt.Errorf("unrecognized pin policy: 0x%x", e.Value[0])
 		}
@@ -463,6 +471,8 @@ const (
 	PINPolicyNever PINPolicy = iota + 1
 	PINPolicyOnce
 	PINPolicyAlways
+	PINPolicyMatchOnce
+	PINPolicyMatchAlways
 )
 
 // TouchPolicy represents proof-of-presence requirements when signing or
@@ -492,15 +502,19 @@ const (
 )
 
 var pinPolicyMap = map[PINPolicy]byte{
-	PINPolicyNever:  0x01,
-	PINPolicyOnce:   0x02,
-	PINPolicyAlways: 0x03,
+	PINPolicyNever:       0x01,
+	PINPolicyOnce:        0x02,
+	PINPolicyAlways:      0x03,
+	PINPolicyMatchOnce:   0x04,
+	PINPolicyMatchAlways: 0x05,
 }
 
 var pinPolicyMapInv = map[byte]PINPolicy{
 	0x01: PINPolicyNever,
 	0x02: PINPolicyOnce,
 	0x03: PINPolicyAlways,
+	0x04: PINPolicyMatchOnce,
+	0x05: PINPolicyMatchAlways,
 }
 
 var touchPolicyMap = map[TouchPolicy]byte{
@@ -875,19 +889,31 @@ func decodePublic(b []byte, alg Algorithm) (crypto.PublicKey, error) {
 // KeyAuth is used to authenticate against the YubiKey on each signing  and
 // decryption request.
 type KeyAuth struct {
-	// PIN, if provided, is a static PIN used to authenticate against the key.
+	// PIN, if provided, is a PIN used to authenticate against the key. The PIN
+	// may be static or a temporary PIN generated using on card biometric comparison.
 	// If provided, PINPrompt is ignored.
 	PIN string
+
 	// PINPrompt can be used to interactively request the PIN from the user. The
 	// method is only called when needed. For example, if a key specifies
 	// PINPolicyOnce, PINPrompt will only be called once per YubiKey struct.
 	PINPrompt func() (pin string, err error)
+
+	// OCCPrompt can be used to interactively request the user complete on card
+	// biometric comparison (OCC) The method is only called when needed.  For example
+	// if a key specifies PINPolicyMatchOnce, OCCPrompt will only be called once per
+	// YubiKey struct.
+	OCCPrompt func() (err error)
 
 	// PINPolicy can be used to specify the PIN caching strategy for the slot. If
 	// not provided, this will be inferred from the attestation certificate.
 	//
 	// This field is required on older (<4.3.0) YubiKeys when using PINPrompt,
 	// as well as for keys imported to the card.
+	//
+	// To override OCC pin policies (PINPolicyMatchOnce, PINPolicyMatchAlways)
+	// when all OCC verification attempts have been consumed set PINPolicyAlways.
+	// Succesful PIN verification will reset the OCC verification attempt counter
 	PINPolicy PINPolicy
 }
 
@@ -904,6 +930,28 @@ func (k KeyAuth) authTx(yk *YubiKey, pp PINPolicy) error {
 		return nil
 	}
 
+	// Check if OCC biometric verification is required.
+	if pp == PINPolicyMatchOnce || pp == PINPolicyMatchAlways {
+		occNeeded, err := ykOCCLoginNeeded(yk.tx)
+		if err != nil {
+			return err
+		}
+		// Early return for cached OCC verification.
+		if pp == PINPolicyMatchOnce && !occNeeded {
+			return nil
+		}
+		// Attempt OCC verification.
+		if k.OCCPrompt != nil {
+			if err := k.OCCPrompt(); err != nil {
+				return fmt.Errorf("occ prompt: %w", err)
+			}
+		}
+
+		_, err = ykOCCLogin(yk.tx, false, k.PIN)
+		return err
+	}
+
+	// Attempt standard PIN verification.
 	pin := k.PIN
 	if pin == "" && k.PINPrompt != nil {
 		p, err := k.PINPrompt()

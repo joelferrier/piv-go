@@ -43,6 +43,17 @@ var (
 	}
 )
 
+var (
+	// ErrOCCLocked is returned when on card biometric comparision is locked.
+	ErrOCCLocked = errors.New("occ biometric verification locked")
+	// ErrOCCTemplateNotFound is returned when on card biometric comparision is requested
+	// for a smart card without an enrolled biometric template.
+	ErrOCCTemplateNotFound = errors.New("occ biometric template not found")
+	// ErrMissingCapability is returned when a smart card is missing a required capability for
+	// the requested method.
+	ErrMissingCapability = errors.New("missing capability")
+)
+
 // Cards lists all smart cards available via PC/SC interface. Card names are
 // strings describing the key, such as "Yubico Yubikey NEO OTP+U2F+CCID 00 00".
 //
@@ -94,6 +105,12 @@ const (
 	insAttest        = 0xf9
 	insGetSerial     = 0xf8
 	insGetMetadata   = 0xf7
+	insDeviceReset   = 0x1f
+
+	paramPINAuth = 0x80
+	paramOCCAuth = 0x96
+
+	occIncapableStatus = 0x6a88
 )
 
 // YubiKey is an exclusive open connection to a YubiKey smart card. While open,
@@ -245,7 +262,7 @@ func ykLogin(tx *scTx, pin string) error {
 	// 3.2.1 VERIFY Card Command
 	// https://csrc.nist.gov/CSRC/media/Publications/sp/800-73/4/archive/2015-05-29/documents/sp800_73-4_pt2_draft.pdf#page=20
 	// https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-73-4.pdf#page=86
-	cmd := apdu{instruction: insVerify, param2: 0x80, data: data}
+	cmd := apdu{instruction: insVerify, param2: paramPINAuth, data: data}
 	if _, err := tx.Transmit(cmd); err != nil {
 		return fmt.Errorf("verify pin: %w", err)
 	}
@@ -253,9 +270,115 @@ func ykLogin(tx *scTx, pin string) error {
 }
 
 func ykLoginNeeded(tx *scTx) bool {
-	cmd := apdu{instruction: insVerify, param2: 0x80}
+	cmd := apdu{instruction: insVerify, param2: paramPINAuth}
 	_, err := tx.Transmit(cmd)
 	return err != nil
+}
+
+// VerifyOCC attempts to authenticate against the card using on card biometric
+// comparison.
+//
+// OCC authentication for other operations are handled separately, and VerifyOCC
+// does not need to be called before those methods.
+//
+// After a specific number of authentication attemps with an invalid OCC match,
+// usually 3, the on card comparison will be locked and refuse further attempts.
+// ErrOCCLocked is returned for all subsequent OCC match attempts until the
+// configured PIN is used to unlock on card biometric comparision and reset the
+// failed OCC match counter.
+//
+// ErrOCCTemplateNotFound is returned when on card biometric comparision is requested
+// for a smart card without at least one configured biometric template.
+// ErrMissingCapability is returned when a smart card does not support biometric
+// comparison.
+func (yk *YubiKey) VerifyOCC() error {
+	_, err := ykOCCLogin(yk.tx, false, "")
+	return err
+}
+
+// VerifyOCC attempts to authenticate against the card using on card biometric
+// comparison to generate a temporary PIN which is stored in RAM on the connected
+// smart card.  The temporary PIN may be used to by a client to authenticate
+// just before OCC protected PIV objects are accessed without requiring additional
+// biometric matches.  The temporary PIN can only be used once when accessing
+// objects protected by a PINPolicyMatchAlways policy.
+//
+// See VerifyOCC for errors returned by this method when on card biometric comparison
+// is locked, not configured, or not supported by a given smart card.
+func (yk *YubiKey) TemporaryPIN() (string, error) {
+	return ykOCCLogin(yk.tx, true, "")
+}
+
+func ykOCCLogin(tx *scTx, genPIN bool, tempPIN string) (string, error) {
+	if genPIN && tempPIN != "" {
+		return "", fmt.Errorf("temporary PIN generation cannot be requested when a temporary PIN is provided")
+	}
+
+	// Check for on card comparision lockout and if a temporary PIN is usable.
+	_, tempPINActive, err := ykOCCRetries(tx)
+	if err != nil {
+		return "", err
+	}
+
+	var data []byte
+
+	const (
+		tempPINSize       = 16
+		occUsePINTag byte = 0x01
+		occGenPINTag byte = 0x02
+		occMatchTag  byte = 0x03
+	)
+
+	switch {
+	case tempPINActive && tempPIN != "":
+		encoded := []byte(tempPIN)
+		data = make([]byte, 2+len(encoded)) // 1 byte tag, 1 byte length + len(value)
+		data[0] = occUsePINTag
+		data[1] = byte(len(encoded))
+		copy(data[2:], encoded)
+	case genPIN:
+		data = []byte{occGenPINTag, 0x00}
+	default:
+		data = []byte{occMatchTag, 0x00}
+	}
+
+	cmd := apdu{instruction: insVerify, param2: paramOCCAuth, data: data}
+	resp, err := tx.Transmit(cmd)
+	if err != nil {
+		return "", fmt.Errorf("verify OCC: %w", err)
+	}
+
+	if genPIN {
+		return string(resp), nil
+	}
+	return "", nil
+}
+
+func ykOCCLoginNeeded(tx *scTx) (bool, error) {
+	cmd := apdu{instruction: insVerify, param2: paramOCCAuth}
+	_, err := tx.Transmit(cmd)
+	if err == nil {
+		return false, nil
+	}
+
+	var raw *apduErr
+	if err != nil && errors.As(err, &raw) {
+		// Non-BIO Yubikeys return 0x6a88 status when fetching Yubikey biometric extensions
+		// which we wrap so that clients can detect OCC incompatible keys using errors.Is().
+		if raw.Status() == occIncapableStatus {
+			return false, ErrMissingCapability
+		}
+		return false, err
+	}
+
+	var e AuthErr
+	if !errors.As(err, &e) {
+		return false, err
+	}
+	if e.Retries == 0 {
+		return false, ErrOCCLocked
+	}
+	return true, nil
 }
 
 // Retries returns the number of attempts remaining to enter the correct PIN.
@@ -264,7 +387,7 @@ func (yk *YubiKey) Retries() (int, error) {
 }
 
 func ykPINRetries(tx *scTx) (int, error) {
-	cmd := apdu{instruction: insVerify, param2: 0x80}
+	cmd := apdu{instruction: insVerify, param2: paramPINAuth}
 	_, err := tx.Transmit(cmd)
 	if err == nil {
 		return 0, fmt.Errorf("expected error code from empty pin")
@@ -276,6 +399,83 @@ func ykPINRetries(tx *scTx) (int, error) {
 	return 0, fmt.Errorf("invalid response: %w", err)
 }
 
+// OCCRetries returns the number of attempts remaining to verify a biometric template and if
+// a temporary PIN has been generated for a OCC protected key using the TemporaryPIN method.
+func (yk *YubiKey) OCCRetries() (retries int, tempPIN bool, err error) {
+	return ykOCCRetries(yk.tx)
+}
+
+func ykOCCRetries(tx *scTx) (retries int, tempPIN bool, err error) {
+	cmd := apdu{instruction: insGetMetadata, param2: paramOCCAuth}
+	resp, err := tx.Transmit(cmd)
+	var e *apduErr
+	if err != nil && errors.As(err, &e) {
+		// Non-BIO Yubikeys return 0x6a88 status when fetching Yubikey biometric extensions
+		// which we wrap so that clients can detect OCC incompatible keys using errors.Is().
+		if e.Status() == occIncapableStatus {
+			return 0, false, ErrMissingCapability
+		}
+		return 0, false, err
+	}
+	// Return non APDU errors.
+	if err != nil {
+		return 0, false, err
+	}
+
+	// Yubikey custom metadata returns three ISO 7816-4 SIMPLE-TLV format data objects.
+	// Each data object uses a single byte value meaning the total response is 9 bytes in length.
+	const occAuthMetadataSize = 9
+	if n := len(resp); n != occAuthMetadataSize {
+		return 0, false, fmt.Errorf("metadata response size mismatch got %d bytes, want %d bytes", n, occAuthMetadataSize)
+	}
+
+	// The first TLV indicates biometric enrollment status. The value is 0x00 indicates
+	// no bio templates are enrolled and 0x01 indicates at least one template is enrolled.
+	const (
+		occTemplateTag      byte = 0x07
+		occTemplateNotFound byte = 0x00
+		occTemplateFound    byte = 0x01
+	)
+	if !bytes.Equal(resp[:2], []byte{occTemplateTag, 0x01}) {
+		return 0, false, fmt.Errorf("invalid OCC enrollment header 0x%x", resp[0:2])
+	}
+	if resp[2] == occTemplateNotFound {
+		return 0, false, ErrOCCTemplateNotFound
+	}
+	if resp[2] != occTemplateFound {
+		return 0, false, fmt.Errorf("invalid OCC enrollment value 0x%x, want one of [0x%x, 0x%x]", resp[2], occTemplateNotFound, occTemplateFound)
+	}
+
+	// The second TLV indicates how many on card biometric comparision (OCC) attempts remain before
+	// OCC verification is locked, expected values range from 0x00 to 0x03.
+	const (
+		occCounterTag byte = 0x06
+		occCounterMax byte = 0x03
+	)
+	if !bytes.Equal(resp[3:5], []byte{occCounterTag, 0x01}) {
+		return 0, false, fmt.Errorf("invalid OCC counter header 0x%x", resp[3:5])
+	}
+	if resp[5] > occCounterMax {
+		return 0, false, fmt.Errorf("invalid OCC counter value 0x%x, want value in range [0x00 ... 0x%x]", resp[5], occCounterMax)
+	}
+	retries = int(resp[5])
+
+	// The third TLV indicates if a temporary PIN is active The value 0x00 indicates
+	// no temporary PIN is active and 0x01 indicates a temporary PIN is active.
+	const (
+		occTempPINTag    byte = 0x08
+		occTempPINActive byte = 0x01
+	)
+	if !bytes.Equal(resp[6:8], []byte{occTempPINTag, 0x01}) {
+		return 0, false, fmt.Errorf("invalid OCC temporary PIN header 0x%x", resp[6:8])
+	}
+	if resp[8] > occTempPINActive {
+		return 0, false, fmt.Errorf("invalid OCC temporary PIN value 0x%x, want one of [0x00, 0x%x]", resp[8], occTempPINActive)
+	}
+
+	return retries, resp[8] == occTempPINActive, nil
+}
+
 // Reset resets the YubiKey PIV applet to its factory settings, wiping all slots
 // and resetting the PIN, PUK, and Management Key to their default values. This
 // does NOT affect data on other applets, such as GPG or U2F.
@@ -284,6 +484,14 @@ func (yk *YubiKey) Reset() error {
 }
 
 func ykReset(tx *scTx, r io.Reader) error {
+	// TODO(joelferrier): replace this basic check with a getDeviceInfo lookup to determine
+	// if PIV reset is blocked.
+	//
+	// PIV reset is not supported when a OCC biometric template is configured.
+	if _, _, err := ykOCCRetries(tx); err == nil || err == ErrOCCLocked {
+		return fmt.Errorf("PIV applet reset not possible when OCC biometric templates are configured: %w", ErrMissingCapability)
+	}
+
 	// Reset only works if both the PIN and PUK are blocked. Before resetting,
 	// try the wrong PIN and PUK multiple times to block them.
 
@@ -333,6 +541,24 @@ func ykReset(tx *scTx, r io.Reader) error {
 	cmd := apdu{instruction: insReset}
 	if _, err := tx.Transmit(cmd); err != nil {
 		return fmt.Errorf("reseting yubikey: %w", err)
+	}
+	return nil
+}
+
+// DeviceReset resets the YubiKey PIV applet and FIDO2 (WebAuthn/Passkey) applet
+// to its factory settings, wiping all keys, resetting PINs, and clearing OCC
+// biometric templates.
+func (yk *YubiKey) DeviceReset() error {
+	return ykDeviceReset(yk.tx)
+}
+
+func ykDeviceReset(tx *scTx) error {
+	if err := ykSelectApplication(tx, aidManagement[:]); err != nil {
+		return fmt.Errorf("selecting management app: %w", err)
+	}
+	cmd := apdu{instruction: insDeviceReset}
+	if _, err := tx.Transmit(cmd); err != nil {
+		return fmt.Errorf("device reset: %w", err)
 	}
 	return nil
 }
@@ -524,7 +750,7 @@ func ykChangePIN(tx *scTx, oldPIN, newPIN string) error {
 	}
 	cmd := apdu{
 		instruction: insChangeReference,
-		param2:      0x80,
+		param2:      paramPINAuth,
 		data:        append(oldPINData, newPINData...),
 	}
 	_, err = tx.Transmit(cmd)
@@ -533,6 +759,10 @@ func ykChangePIN(tx *scTx, oldPIN, newPIN string) error {
 
 // Unblock unblocks the PIN, setting it to a new value.
 func (yk *YubiKey) Unblock(puk, newPIN string) error {
+	// PUK based pin onblock is not supported on OCC enabled Yubikeys.
+	if _, _, err := ykOCCRetries(yk.tx); err == nil || errors.Is(err, ErrOCCLocked) || errors.Is(err, ErrOCCTemplateNotFound) {
+		return fmt.Errorf("PUK pin unblock not supported: %w", ErrMissingCapability)
+	}
 	return ykUnblockPIN(yk.tx, puk, newPIN)
 }
 
@@ -547,7 +777,7 @@ func ykUnblockPIN(tx *scTx, puk, newPIN string) error {
 	}
 	cmd := apdu{
 		instruction: insResetRetry,
-		param2:      0x80,
+		param2:      paramPINAuth,
 		data:        append(pukData, newPINData...),
 	}
 	_, err = tx.Transmit(cmd)
@@ -764,7 +994,7 @@ func ykGetProtectedMetadata(tx *scTx, pin string) (*Metadata, error) {
 		data: []byte{
 			0x5c, // Tag list
 			0x03,
-			0x5f,
+			0x5f, // PIV printed information object (0x5fc109) which is implicitly PIN protected.
 			0xc1,
 			0x09,
 		},

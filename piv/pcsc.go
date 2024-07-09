@@ -82,6 +82,8 @@ func (a *apduErr) Error() string {
 		// so that it's clear that the reason is a block rather than a simple
 		// failed authentication verification.
 		msg = "authentication method blocked"
+	case 0x6985:
+		msg = "conditions of use not satisfied"
 	case 0x6987:
 		msg = "expected secure messaging data objects are missing"
 	case 0x6988:
@@ -97,6 +99,8 @@ func (a *apduErr) Error() string {
 		msg = "incorrect parameter in P1 or P2"
 	case 0x6a88:
 		msg = "referenced data or reference data not found"
+	case 0x6d00:
+		msg = "instruction code not supported or invalid"
 	}
 
 	if msg != "" {
@@ -110,6 +114,8 @@ func (a *apduErr) Unwrap() error {
 	st := a.Status()
 	switch {
 	case st == 0x6a82:
+		return ErrNotFound
+	case st == 0x6a88:
 		return ErrNotFound
 	case st == 0x6300:
 		return AuthErr{0}
